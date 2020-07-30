@@ -580,10 +580,14 @@ static void sony_set_leds(struct sony_sc *sc);
 static inline void sony_schedule_work(struct sony_sc *sc,
 				      enum sony_worker which)
 {
+	unsigned long flags;
+
 	switch (which) {
 	case SONY_WORKER_STATE:
-		if (!sc->defer_initialization)
+		spin_lock_irqsave(&sc->lock, flags);
+		if (!sc->defer_initialization && sc->state_worker_initialized)
 			schedule_work(&sc->state_worker);
+		spin_unlock_irqrestore(&sc->lock, flags);
 		break;
 	case SONY_WORKER_HOTPLUG:
 		if (sc->hotplug_worker_initialized)
@@ -596,7 +600,7 @@ static ssize_t ds4_show_poll_interval(struct device *dev,
 				struct device_attribute
 				*attr, char *buf)
 {
-	struct hid_device *hdev = to_hid_device(dev);
+	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
 	struct sony_sc *sc = hid_get_drvdata(hdev);
 
 	return snprintf(buf, PAGE_SIZE, "%i\n", sc->ds4_bt_poll_interval);
@@ -606,7 +610,7 @@ static ssize_t ds4_store_poll_interval(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
-	struct hid_device *hdev = to_hid_device(dev);
+	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
 	struct sony_sc *sc = hid_get_drvdata(hdev);
 	unsigned long flags;
 	u8 interval;
@@ -1182,6 +1186,67 @@ static int sony_raw_event(struct hid_device *hdev, struct hid_report *report,
 		}
 
 		dualshock4_parse_report(sc, rd, size);
+	} else if ((sc->quirks & DUALSHOCK4_DONGLE) && rd[0] == 0x01 &&
+			size == 64) {
+		unsigned long flags;
+		enum ds4_dongle_state dongle_state;
+
+		/*
+		 * In the case of a DS4 USB dongle, bit[2] of byte 31 indicates
+		 * if a DS4 is actually connected (indicated by '0').
+		 * For non-dongle, this bit is always 0 (connected).
+		 */
+		bool connected = (rd[31] & 0x04) ? false : true;
+
+		spin_lock_irqsave(&sc->lock, flags);
+		dongle_state = sc->ds4_dongle_state;
+		spin_unlock_irqrestore(&sc->lock, flags);
+
+		/*
+		 * The dongle always sends input reports even when no
+		 * DS4 is attached. When a DS4 is connected, we need to
+		 * obtain calibration data before we can use it.
+		 * The code below tracks dongle state and kicks of
+		 * calibration when needed and only allows us to process
+		 * input if a DS4 is actually connected.
+		 */
+		if (dongle_state == DONGLE_DISCONNECTED && connected) {
+			hid_info(sc->hdev, "DualShock 4 USB dongle: controller connected\n");
+			sony_set_leds(sc);
+
+			spin_lock_irqsave(&sc->lock, flags);
+			sc->ds4_dongle_state = DONGLE_CALIBRATING;
+			spin_unlock_irqrestore(&sc->lock, flags);
+
+			sony_schedule_work(sc, SONY_WORKER_HOTPLUG);
+
+			/* Don't process the report since we don't have
+			 * calibration data, but let hidraw have it anyway.
+			 */
+			return 0;
+		} else if ((dongle_state == DONGLE_CONNECTED ||
+			    dongle_state == DONGLE_DISABLED) && !connected) {
+			hid_info(sc->hdev, "DualShock 4 USB dongle: controller disconnected\n");
+
+			spin_lock_irqsave(&sc->lock, flags);
+			sc->ds4_dongle_state = DONGLE_DISCONNECTED;
+			spin_unlock_irqrestore(&sc->lock, flags);
+
+			/* Return 0, so hidraw can get the report. */
+			return 0;
+		} else if (dongle_state == DONGLE_CALIBRATING ||
+			   dongle_state == DONGLE_DISABLED ||
+			   dongle_state == DONGLE_DISCONNECTED) {
+			/* Return 0, so hidraw can get the report. */
+			return 0;
+		}
+
+		dualshock4_parse_report(sc, rd, size);
+	}
+
+	if (sc->defer_initialization) {
+		sc->defer_initialization = 0;
+		sony_schedule_work(sc, SONY_WORKER_STATE);
 	}
 
 	if (sc->defer_initialization) {
@@ -1375,6 +1440,48 @@ static int sony_register_sensors(struct sony_sc *sc)
 		__set_bit(EV_MSC, sc->sensor_dev->evbit);
 		__set_bit(MSC_TIMESTAMP, sc->sensor_dev->mscbit);
 	}
+	snprintf(name, name_sz, "%s" SENSOR_SUFFIX, sc->hdev->name);
+	sc->sensor_dev->name = name;
+
+	if (sc->quirks & SIXAXIS_CONTROLLER) {
+		/* For the DS3 we only support the accelerometer, which works
+		 * quite well even without calibration. The device also has
+		 * a 1-axis gyro, but it is very difficult to manage from within
+		 * the driver even to get data, the sensor is inaccurate and
+		 * the behavior is very different between hardware revisions.
+		 */
+		input_set_abs_params(sc->sensor_dev, ABS_X, -512, 511, 4, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_Y, -512, 511, 4, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_Z, -512, 511, 4, 0);
+		input_abs_set_res(sc->sensor_dev, ABS_X, SIXAXIS_ACC_RES_PER_G);
+		input_abs_set_res(sc->sensor_dev, ABS_Y, SIXAXIS_ACC_RES_PER_G);
+		input_abs_set_res(sc->sensor_dev, ABS_Z, SIXAXIS_ACC_RES_PER_G);
+	} else if (sc->quirks & DUALSHOCK4_CONTROLLER) {
+		range = DS4_ACC_RES_PER_G*4;
+		input_set_abs_params(sc->sensor_dev, ABS_X, -range, range, 16, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_Y, -range, range, 16, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_Z, -range, range, 16, 0);
+		input_abs_set_res(sc->sensor_dev, ABS_X, DS4_ACC_RES_PER_G);
+		input_abs_set_res(sc->sensor_dev, ABS_Y, DS4_ACC_RES_PER_G);
+		input_abs_set_res(sc->sensor_dev, ABS_Z, DS4_ACC_RES_PER_G);
+
+		range = DS4_GYRO_RES_PER_DEG_S*2048;
+		input_set_abs_params(sc->sensor_dev, ABS_RX, -range, range, 16, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_RY, -range, range, 16, 0);
+		input_set_abs_params(sc->sensor_dev, ABS_RZ, -range, range, 16, 0);
+		input_abs_set_res(sc->sensor_dev, ABS_RX, DS4_GYRO_RES_PER_DEG_S);
+		input_abs_set_res(sc->sensor_dev, ABS_RY, DS4_GYRO_RES_PER_DEG_S);
+		input_abs_set_res(sc->sensor_dev, ABS_RZ, DS4_GYRO_RES_PER_DEG_S);
+
+		__set_bit(EV_MSC, sc->sensor_dev->evbit);
+		__set_bit(MSC_TIMESTAMP, sc->sensor_dev->mscbit);
+	}
+
+	__set_bit(INPUT_PROP_ACCELEROMETER, sc->sensor_dev->propbit);
+
+	ret = input_register_device(sc->sensor_dev);
+	if (ret < 0)
+		goto err;
 
 	__set_bit(INPUT_PROP_ACCELEROMETER, sc->sensor_dev->propbit);
 
@@ -1613,6 +1720,51 @@ static int dualshock4_get_calibration_data(struct sony_sc *sc)
 err_stop:
 	kfree(buf);
 	return ret;
+}
+
+static void dualshock4_calibration_work(struct work_struct *work)
+{
+	struct sony_sc *sc = container_of(work, struct sony_sc, hotplug_worker);
+	unsigned long flags;
+	enum ds4_dongle_state dongle_state;
+	int ret;
+	short gyro_pitch_bias, gyro_pitch_plus, gyro_pitch_minus;
+	short gyro_yaw_bias, gyro_yaw_plus, gyro_yaw_minus;
+	short gyro_roll_bias, gyro_roll_plus, gyro_roll_minus;
+	short gyro_speed_plus, gyro_speed_minus;
+	short acc_x_plus, acc_x_minus;
+	short acc_y_plus, acc_y_minus;
+	short acc_z_plus, acc_z_minus;
+	int speed_2x;
+	int range_2g;
+
+	/* For Bluetooth we use a different request, which supports CRC.
+	 * Note: in Bluetooth mode feature report 0x02 also changes the state
+	 * of the controller, so that it sends input reports of type 0x11.
+	 */
+	if (sc->quirks & (DUALSHOCK4_CONTROLLER_USB | DUALSHOCK4_DONGLE)) {
+		buf = kmalloc(DS4_FEATURE_REPORT_0x02_SIZE, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+
+	ret = dualshock4_get_calibration_data(sc);
+	if (ret < 0) {
+		/* This call is very unlikely to fail for the dongle. When it
+		 * fails we are probably in a very bad state, so mark the
+		 * dongle as disabled. We will re-enable the dongle if a new
+		 * DS4 hotplug is detect from sony_raw_event as any issues
+		 * are likely resolved then (the dongle is quite stupid).
+		 */
+		hid_err(sc->hdev, "DualShock 4 USB dongle: calibration failed, disabling device\n");
+		dongle_state = DONGLE_DISABLED;
+	} else {
+		hid_info(sc->hdev, "DualShock 4 USB dongle: calibration completed\n");
+		dongle_state = DONGLE_CONNECTED;
+	}
+
+	spin_lock_irqsave(&sc->lock, flags);
+	sc->ds4_dongle_state = dongle_state;
+	spin_unlock_irqrestore(&sc->lock, flags);
 }
 
 static void dualshock4_calibration_work(struct work_struct *work)
@@ -2161,9 +2313,15 @@ static int sony_play_effect(struct input_dev *dev, void *data,
 
 static int sony_init_ff(struct sony_sc *sc)
 {
-	struct hid_input *hidinput = list_entry(sc->hdev->inputs.next,
-						struct hid_input, list);
-	struct input_dev *input_dev = hidinput->input;
+	struct hid_input *hidinput;
+	struct input_dev *input_dev;
+
+	if (list_empty(&sc->hdev->inputs)) {
+		hid_err(sc->hdev, "no inputs found\n");
+		return -ENODEV;
+	}
+	hidinput = list_entry(sc->hdev->inputs.next, struct hid_input, list);
+	input_dev = hidinput->input;
 
 	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
 	return input_ff_create_memless(input_dev, NULL, sony_play_effect);
@@ -2490,12 +2648,17 @@ static inline void sony_init_output_report(struct sony_sc *sc,
 
 static inline void sony_cancel_work_sync(struct sony_sc *sc)
 {
+	unsigned long flags;
+
 	if (sc->hotplug_worker_initialized)
 		cancel_work_sync(&sc->hotplug_worker);
-	if (sc->state_worker_initialized)
+	if (sc->state_worker_initialized) {
+		spin_lock_irqsave(&sc->lock, flags);
+		sc->state_worker_initialized = 0;
+		spin_unlock_irqrestore(&sc->lock, flags);
 		cancel_work_sync(&sc->state_worker);
+	}
 }
-
 
 static int sony_input_configured(struct hid_device *hdev,
 					struct hid_input *hidinput)
@@ -2703,7 +2866,68 @@ err_stop:
 	kfree(sc->output_report_dmabuf);
 	sony_remove_dev_list(sc);
 	sony_release_device_id(sc);
-	hid_hw_stop(hdev);
+	return ret;
+}
+
+static int sony_probe(struct hid_device *hdev, const struct hid_device_id *id)
+{
+	int ret;
+	unsigned long quirks = id->driver_data;
+	struct sony_sc *sc;
+	unsigned int connect_mask = HID_CONNECT_DEFAULT;
+
+	sc = devm_kzalloc(&hdev->dev, sizeof(*sc), GFP_KERNEL);
+	if (sc == NULL) {
+		hid_err(hdev, "can't alloc sony descriptor\n");
+		return -ENOMEM;
+	}
+
+	spin_lock_init(&sc->lock);
+
+	sc->quirks = quirks;
+	hid_set_drvdata(hdev, sc);
+	sc->hdev = hdev;
+
+	ret = hid_parse(hdev);
+	if (ret) {
+		hid_err(hdev, "parse failed\n");
+		return ret;
+	}
+
+	if (sc->quirks & VAIO_RDESC_CONSTANT)
+		connect_mask |= HID_CONNECT_HIDDEV_FORCE;
+	else if (sc->quirks & SIXAXIS_CONTROLLER)
+		connect_mask |= HID_CONNECT_HIDDEV_FORCE;
+
+	/* Patch the hw version on DS3/4 compatible devices, so applications can
+	 * distinguish between the default HID mappings and the mappings defined
+	 * by the Linux game controller spec. This is important for the SDL2
+	 * library, which has a game controller database, which uses device ids
+	 * in combination with version as a key.
+	 */
+	if (sc->quirks & (SIXAXIS_CONTROLLER | DUALSHOCK4_CONTROLLER))
+		hdev->version |= 0x8000;
+
+	ret = hid_hw_start(hdev, connect_mask);
+	if (ret) {
+		hid_err(hdev, "hw start failed\n");
+		return ret;
+	}
+
+	/* sony_input_configured can fail, but this doesn't result
+	 * in hid_hw_start failures (intended). Check whether
+	 * the HID layer claimed the device else fail.
+	 * We don't know the actual reason for the failure, most
+	 * likely it is due to EEXIST in case of double connection
+	 * of USB and Bluetooth, but could have been due to ENOMEM
+	 * or other reasons as well.
+	 */
+	if (!(hdev->claimed & HID_CLAIMED_INPUT)) {
+		hid_err(hdev, "failed to claim input\n");
+		hid_hw_stop(hdev);
+		return -ENODEV;
+	}
+
 	return ret;
 }
 
